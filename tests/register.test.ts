@@ -22,6 +22,7 @@ interface World {
   forkRead: number
   transcript: string
   subscriber: boolean
+  herdr: string[]
 }
 
 function stubs(on: any, world: World, env: Record<string, string> = { HOME: '/home/u' }) {
@@ -33,6 +34,10 @@ function stubs(on: any, world: World, env: Record<string, string> = { HOME: '/ho
   on('command.register', () => ({ value: undefined }))
   on('ui.log', ($: any, e: any) => { world.logs.push(e.text); return { value: undefined } })
   on('process.run', ($: any, e: any) => {
+    if (e.argv[0] === 'herdr') {
+      world.herdr.push(e.argv.slice(4).join(' '))
+      return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
     expect(e.argv.slice(4)).toEqual(['/home/u/.claude/projects/-work/sid.jsonl', '/home/u/.claude/projects', 'sid.jsonl', '400000'])
     return { value: { exitCode: world.transcript ? 0 : 1, stdout: world.transcript, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
@@ -61,7 +66,7 @@ function stubs(on: any, world: World, env: Record<string, string> = { HOME: '/ho
 }
 
 function world(partial: Partial<World> = {}): World {
-  return { asks: [], answers: [], filled: [], logs: [], forks: 0, forkRead: 0, transcript: '', subscriber: true, ...partial }
+  return { asks: [], answers: [], filled: [], logs: [], forks: 0, forkRead: 0, transcript: '', subscriber: true, herdr: [], ...partial }
 }
 
 /** One main-loop turn whose single request reads `read` cached tokens. */
@@ -195,4 +200,20 @@ test('a forked session, whose transcript is not written yet, is judged from the 
   const kept = await $.prompt.submit({ text: 'continue', wait: false, origin: { kind: 'composer' } })
   // No API key in the environment: a Claude login, whose writes are 1h (2x input).
   expect(kept.drop).toMatch(/expired 1h ago: this prompt re-caches 300k tokens \(~\$2\.34/)
+})
+
+test('inside herdr, the cache token shows a doomed session and clears when it is warm again', async ($, on) => {
+  const w = world({ transcript: row(T0, usage1h(600_000)), forkRead: 600_000 })
+  const clock = stubs(on, w, { HOME: '/home/u', HERDR_ENV: '1', HERDR_PANE_ID: 'w1:p1' })
+  stepUsage(on, 600_000)
+  await $.session.start({ cwd: '/work', surface: 'terminal', isInteractive: false })
+  expect(w.herdr).toEqual(['--source cache-guard --agent claude --clear-token cache']) // warm: clear any stale token
+  await turn($, on, 600_000)
+  await clock.advance(59 * MIN)
+  expect(w.herdr.length).toBe(1)
+  await clock.advance(2 * MIN + 1_000)
+  expect(w.herdr.at(-1)).toBe('--source cache-guard --agent claude --token cache=cold 601k --ttl-ms 86400000')
+  await turn($, on, 600_000, 't2')
+  expect(w.herdr.at(-1)).toBe('--source cache-guard --agent claude --clear-token cache')
+  expect(w.herdr.length).toBe(3)
 })

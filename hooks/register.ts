@@ -26,6 +26,8 @@ import {
   NAME,
   ONE_HOUR,
   FIVE_MINUTES,
+  HERDR_SOURCE,
+  HERDR_TOKEN,
   type Settings,
   claudePrice,
   decideWarm,
@@ -34,6 +36,7 @@ import {
   formatCost,
   formatDuration,
   formatTokens,
+  herdrCacheValue,
   mergeSettings,
   missCost,
   warmDeadline,
@@ -77,6 +80,10 @@ interface State {
   warms: number
   /** Why no refresh is scheduled, for /cache-guard. */
   stopped: string
+  /** Fires when the cache expires, to tell herdr. */
+  expiry?: { cancel: () => void }
+  /** The `cache` token last reported to herdr; null before the first report. */
+  herdrLast: string | undefined | null
 }
 
 export function register(on: On): void {
@@ -90,6 +97,7 @@ export function register(on: On): void {
     warming: false,
     warms: 0,
     stopped: 'waiting for the first response',
+    herdrLast: null,
   }
 
   on('session.start', async ($, e, next) => {
@@ -104,7 +112,14 @@ export function register(on: On): void {
     })
     // A resumed session: its last response and TTL come from the transcript.
     await readTranscript($, s, true)
+    await syncHerdr($, s)
     return result
+  })
+
+  on('session.end', async ($, e, next) => {
+    s.expiry?.cancel()
+    await reportHerdr($, s, undefined)
+    return next(e)
   })
 
   // The settings-hook SessionStart: its transcript_path, and on a resume or fork how long ago the
@@ -120,6 +135,7 @@ export function register(on: On): void {
         s.clock = { lastAt: at, lastRealAt: at, promptTokens: e.context_tokens, tokens: e.context_tokens, model: e.model ?? (await $.session.model()) }
       }
     }
+    await syncHerdr($, s)
     return result
   })
 
@@ -181,7 +197,10 @@ export function register(on: On): void {
     if (arg === 'on' || arg === 'off') {
       s.sessionOn = arg === 'on'
       if (s.sessionOn) await schedule($, s)
-      else cancel(s, 'turned off for this session')
+      else {
+        cancel(s, 'turned off for this session')
+        await syncHerdr($, s)
+      }
       return { text: `cache-guard ${arg} for this session` }
     }
     if (arg === 'warm') {
@@ -267,8 +286,14 @@ function cancel(s: State, why: string): void {
   s.stopped = why
 }
 
-/** Arms the next refresh at 90% of the TTL after the last cache use, inside the idle limit. */
+/** Arms the next refresh (and the expiry report to herdr) after the cache was used. */
 async function schedule($: EngineInterface, s: State): Promise<void> {
+  await arm($, s)
+  await syncHerdr($, s)
+}
+
+/** Arms the next refresh at 90% of the TTL after the last cache use, inside the idle limit. */
+async function arm($: EngineInterface, s: State): Promise<void> {
   s.timer?.cancel()
   s.timer = undefined
   const clock = s.clock
@@ -359,4 +384,38 @@ async function status($: EngineInterface, s: State): Promise<string> {
   lines.push(`Keep-warm: ${on && s.settings.warm.enabled ? (s.timer ? 'next refresh scheduled' : `idle (${s.stopped || 'nothing to keep'})`) : 'off'}.`)
   lines.push(`Warning: ${on && s.settings.warn.enabled ? `on, from ${formatCost(s.settings.warn.minCost)} at API prices` : 'off'}.`)
   return lines.join('\n')
+}
+
+/**
+ * herdr's `cache` pane token: "cold 664k" once the cache has expired with a re-cache worth a
+ * warning, nothing while it is warm (an expiry timer re-checks then) or small. Inside herdr only.
+ */
+async function syncHerdr($: EngineInterface, s: State): Promise<void> {
+  s.expiry?.cancel()
+  s.expiry = undefined
+  const clock = s.clock
+  let value: string | undefined
+  if (clock && s.sessionOn && s.stepsInFlight === 0) {
+    const now = await $.clock.now()
+    const left = clock.lastAt + s.ttl.ms - now
+    if (left > 0) {
+      s.expiry = $.clock.after(left + 1_000, () => {
+        void syncHerdr($, s)
+      })
+    } else {
+      value = herdrCacheValue({ kind: 'expired', idleMs: -left }, clock.tokens, missCost(clock.tokens, claudePrice(clock.model), s.ttl.ms), s.settings)
+    }
+  }
+  await reportHerdr($, s, value)
+}
+
+/** One `herdr pane report-metadata` call when the token changes; any failure is ignored. */
+async function reportHerdr($: EngineInterface, s: State, value: string | undefined): Promise<void> {
+  if (value === s.herdrLast) return
+  if ((await $.env.get('HERDR_ENV')) !== '1') return
+  const pane = await $.env.get('HERDR_PANE_ID')
+  if (!pane) return
+  s.herdrLast = value
+  const change = value === undefined ? ['--clear-token', HERDR_TOKEN] : ['--token', `${HERDR_TOKEN}=${value}`, '--ttl-ms', '86400000']
+  await $.process.run(['herdr', 'pane', 'report-metadata', pane, '--source', HERDR_SOURCE, '--agent', 'claude', ...change], { timeoutMs: 3_000 }).catch(() => undefined)
 }

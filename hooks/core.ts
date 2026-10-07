@@ -42,6 +42,10 @@ export interface Settings {
     /** What a keep-warm request asks, where the harness has to send a message. */
     prompt: string;
   };
+  herdr: {
+    /** Report the pane token `cache` to herdr (inside a herdr pane) so its agents sidebar can show doomed sessions. */
+    enabled: boolean;
+  };
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -54,7 +58,12 @@ export const DEFAULT_SETTINGS: Settings = {
     idleMinutes: { "5m": 30, "1h": 120 },
     prompt: "Cache keep-alive. Do not use tools or think. Reply with exactly: ok",
   },
+  herdr: { enabled: true },
 };
+
+/** The herdr pane token the ports report (`herdr pane report-metadata --source cache-guard`). */
+export const HERDR_TOKEN = "cache";
+export const HERDR_SOURCE = NAME;
 
 export const FIVE_MINUTES = 5 * 60_000;
 export const ONE_HOUR = 60 * 60_000;
@@ -123,6 +132,18 @@ export type ColdReason =
   | { kind: "expired"; idleMs: number }
   | { kind: "model"; from: string; to: string }
   | { kind: "idle"; idleMs: number };
+
+/**
+ * The herdr `cache` token: `cold 664k` (or `cold? 180k` when only idle time suggests it) while the
+ * next prompt would re-cache at least the warning threshold, else undefined (clear the token).
+ * Warm and small caches report nothing, so the sidebar lists only the doomed sessions.
+ */
+export function herdrCacheValue(reason: ColdReason | undefined, tokens: number, cost: number | undefined, settings: Settings): string | undefined {
+  if (!reason || !settings.enabled || !settings.herdr.enabled) return undefined;
+  const big = cost !== undefined ? cost >= settings.warn.minCost : tokens >= settings.warn.minTokens;
+  if (!big) return undefined;
+  return `${reason.kind === "idle" ? "cold?" : "cold"} ${formatTokens(tokens)}`;
+}
 
 /** One line saying why the next request misses and what that costs. */
 export function describeMiss(reason: ColdReason, tokens: number, cost: number | undefined): string {
