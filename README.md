@@ -19,7 +19,7 @@ Each refresh has to pay for itself by Pi's rule:
 
 - **When:** the expected saving must be at least $0.05. While you are idle that saving is
   `15% x miss cost - refresh cost`; during a long tool run it is the whole miss cost.
-- **Size:** on the 1h tier of Opus 5.5 that works out to about 15k tokens of context or more.
+- **Size:** on the 1h tier of Opus 5.5 that works out to about 52k tokens of context or more.
 - **For how long:** refreshes stop 2 hours (1h tier) or 30 minutes (5m tier) after the last real
   request.
 - **On a miss:** a refresh that reads less than 80% of the prefix from the cache stops the
