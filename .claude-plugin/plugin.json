@@ -1,0 +1,8 @@
+{
+  "name": "cache-guard",
+  "version": "0.1.0",
+  "description": "Keeps the prompt cache warm while you are away and asks before a prompt that would re-cache a large conversation.",
+  "author": { "name": "Spencer Boucher" },
+  "repository": "https://github.com/justmytwospence/claude-cache-guard",
+  "license": "MIT"
+}
