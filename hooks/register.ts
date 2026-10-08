@@ -36,6 +36,8 @@ import {
   formatCost,
   formatDuration,
   formatTokens,
+  choiceCosts,
+  compactionFocus,
   herdrCacheValue,
   mergeSettings,
   missCost,
@@ -48,7 +50,11 @@ import { parseTail, transcriptPath } from './transcript'
 
 const COMMAND = NAME
 const KEEP = 'Keep the prompt'
+const FRESH = 'New conversation'
+const COMPACT = 'Compact first'
 const SEND = 'Send anyway'
+const SUMMARY_DEFAULT = 'Default summary'
+const SUMMARY_FOCUS = 'Focus on this prompt'
 /** How much of a transcript's end to read: enough for the last few responses. */
 const TAIL_BYTES = 400_000
 const TAIL_SCRIPT = 'f=$1; [ -f "$f" ] || f=$(ls "$2"/*/"$3" 2>/dev/null | head -n 1); [ -n "$f" ] && tail -c "$4" "$f"'
@@ -181,15 +187,38 @@ export function register(on: On): void {
     if (!text || text.startsWith('/')) return next(e)
     const miss = await assess($, s)
     if (!miss) return next(e)
+    // Keep first, so a reflexive Enter (or Esc) spends nothing; then cheapest to dearest.
+    const labels = { keep: KEEP, fresh: `${FRESH} (~$0)`, compact: `${COMPACT} (~${formatCost(miss.costs.compact)})`, send: `${SEND} (~${formatCost(miss.costs.send)})` }
     let answer: string | undefined
     try {
-      answer = await $.ui.ask(`Prompt cache miss. ${miss.line} Send it anyway?`, { options: [KEEP, SEND], header: 'Cache' })
+      answer = await $.ui.ask(`Prompt cache miss. ${miss.line} What now?`, { header: 'Cache', options: [labels.keep, labels.fresh, labels.compact, labels.send] })
     } catch {
       answer = undefined // dismissed: keep it
     }
-    if (answer === SEND) return next(e)
+    if (answer === labels.send) return next(e)
+    if (answer === labels.fresh) {
+      $.clock.after(0, () => {
+        void startFresh($, s, e.text)
+      })
+      return { drop: 'Starting a new conversation with your prompt.' }
+    }
+    if (answer === labels.compact) {
+      let how: string | undefined
+      try {
+        how = await $.ui.ask('What should the summary keep? (Type your own guidance under Other.)', { header: 'Compact', options: [SUMMARY_DEFAULT, SUMMARY_FOCUS] })
+      } catch {
+        how = undefined
+      }
+      if (how !== undefined) {
+        const instructions = how === SUMMARY_DEFAULT ? undefined : how === SUMMARY_FOCUS ? compactionFocus(e.text) : how
+        $.clock.after(0, () => {
+          void compactThenSend($, s, e.text, instructions)
+        })
+        return { drop: 'Compacting, then sending your prompt.' }
+      }
+    }
     await $.prompt.fill({ text: e.text })
-    return { drop: `Kept in the prompt box. ${miss.line} /compact or /clear first is cheaper.` }
+    return { drop: `Kept in the prompt box. ${miss.line} /cache-guard off stops asking in this session.` }
   })
 
   on('command.run', { command: COMMAND }, async ($, e) => {
@@ -355,7 +384,7 @@ async function refresh($: EngineInterface, s: State, forced = false): Promise<vo
 }
 
 /** Why the next prompt misses the cache and what that costs, when it is worth asking about. */
-async function assess($: EngineInterface, s: State): Promise<{ line: string } | undefined> {
+async function assess($: EngineInterface, s: State): Promise<{ line: string; costs: { send: number; compact: number } } | undefined> {
   if (!s.settings.enabled || !s.settings.warn.enabled) return undefined
   if (!s.clock) await readTranscript($, s, true)
   const clock = s.clock
@@ -365,7 +394,7 @@ async function assess($: EngineInterface, s: State): Promise<{ line: string } | 
   if (left > 0) return undefined
   const cost = missCost(clock.tokens, claudePrice(clock.model), s.ttl.ms)
   if (!worthWarning(clock.tokens, cost, s.settings)) return undefined
-  return { line: describeMiss({ kind: 'expired', idleMs: -left }, clock.tokens, cost) }
+  return { line: describeMiss({ kind: 'expired', idleMs: -left }, clock.tokens, cost), costs: choiceCosts(clock.tokens, claudePrice(clock.model), s.ttl.ms) }
 }
 
 async function status($: EngineInterface, s: State): Promise<string> {
@@ -418,4 +447,35 @@ async function reportHerdr($: EngineInterface, s: State, value: string | undefin
   s.herdrLast = value
   const change = value === undefined ? ['--clear-token', HERDR_TOKEN] : ['--token', `${HERDR_TOKEN}=${value}`, '--ttl-ms', '86400000']
   await $.process.run(['herdr', 'pane', 'report-metadata', pane, '--source', HERDR_SOURCE, '--agent', 'claude', ...change], { timeoutMs: 3_000 }).catch(() => undefined)
+}
+
+/** /clear, then the held prompt as the new conversation's first. */
+async function startFresh($: EngineInterface, s: State, text: string): Promise<void> {
+  try {
+    await $.command.run({ command: 'clear' })
+    s.clock = undefined
+    s.timer?.cancel()
+    s.timer = undefined
+    await $.prompt.submit({ text, asUser: true })
+  } catch (error) {
+    $.ui.log(`could not start a new conversation (${error instanceof Error ? error.message : String(error)}); your prompt is back in the box`)
+    await $.prompt.fill({ text })
+  }
+}
+
+/** Compaction (with the chosen guidance), then the held prompt onto the summary. */
+async function compactThenSend($: EngineInterface, s: State, text: string, instructions: string | undefined): Promise<void> {
+  try {
+    const result = await $.session.compact(instructions ? { instructions } : {})
+    if ('skip' in result && typeof result.skip === 'string') {
+      $.ui.log(`compaction was skipped (${result.skip}); your prompt is back in the box`)
+      await $.prompt.fill({ text })
+      return
+    }
+    s.clock = undefined
+    await $.prompt.submit({ text, asUser: true })
+  } catch (error) {
+    $.ui.log(`compaction failed (${error instanceof Error ? error.message : String(error)}); your prompt is back in the box`)
+    await $.prompt.fill({ text })
+  }
 }

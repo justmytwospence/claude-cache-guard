@@ -31,12 +31,27 @@ Each refresh has to pay for itself by Pi's rule:
 cost at least `warn.minCost` (default $0.50 at API prices):
 
 ```
-Prompt cache miss. The prompt cache expired 10m ago: this prompt re-caches 601k tokens (~$4.69 at API prices). Send it anyway?
-1. Keep the prompt   2. Send anyway
+Prompt cache miss. The prompt cache expired 10m ago: this prompt re-caches 601k tokens (~$4.69 at API prices). What now?
+1. Keep the prompt
+2. New conversation (~$0)
+3. Compact first (~$2.40)
+4. Send anyway (~$4.81)
 ```
 
-`Keep the prompt` (the default, also on Esc) drops the submission and puts the text back in the
-prompt box. Resumed and forked sessions are judged from the transcript, or from the SessionStart
+The options:
+
+- **Keep the prompt.** The default, so Enter or Esc spends nothing. It drops the submission and
+  puts the text back in the prompt box.
+- **New conversation.** Runs `/clear` and sends the prompt as the new conversation's first.
+- **Compact first.** Asks what the summary should keep: the default summary, a summary focused on
+  the held prompt (keep what it needs, drop the rest), or your own guidance typed under "Type
+  something". It then compacts and sends the prompt onto the summary. If compaction is skipped or
+  fails, the prompt goes back in the box.
+- **Send anyway.**
+
+The headline cost is what the miss adds over a cache hit; the costs in the options are each path's
+total. Images attached to a held prompt are not resent by the New conversation and Compact paths.
+`/cache-guard off` stops asking in the session. Resumed and forked sessions are judged from the transcript, or from the SessionStart
 hook input (`seconds_since_last_response`, `context_tokens`) when the transcript is not written
 yet. Prompts from loops, peers, notifications, the SDK and `-p` are never held, and neither are
 slash commands.

@@ -145,6 +145,21 @@ export function herdrCacheValue(reason: ColdReason | undefined, tokens: number, 
   return `${reason.kind === "idle" ? "cold?" : "cold"} ${formatTokens(tokens)}`;
 }
 
+/**
+ * Rough costs, in dollars at list prices, of the two ways through a cold cache that keep the
+ * history: send the prompt and write the whole prefix to the cache again, or compact first, which
+ * reads it once uncached (plus a summary, not counted) and continues on a small context. Starting
+ * fresh costs about nothing.
+ */
+export function choiceCosts(tokens: number, price: Price, ttlMs: number): { send: number; compact: number } {
+  return { send: (tokens * writePrice(price, ttlMs)) / 1e6, compact: (tokens * price.input) / 1e6 };
+}
+
+/** Compaction guidance that keeps what the held prompt needs. */
+export function compactionFocus(prompt: string): string {
+  return `Keep what is needed to continue with the user's next request, quoted below, and drop the rest.\n\n${prompt.trim()}`;
+}
+
 /** One line saying why the next request misses and what that costs. */
 export function describeMiss(reason: ColdReason, tokens: number, cost: number | undefined): string {
   const amount = `${formatTokens(tokens)} tokens${cost === undefined ? "" : ` (~${formatCost(cost)} at API prices)`}`;

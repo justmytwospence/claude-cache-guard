@@ -23,6 +23,10 @@ interface World {
   transcript: string
   subscriber: boolean
   herdr: string[]
+  menus: string[][]
+  submitted: string[]
+  commands: string[]
+  compactions: (string | undefined)[]
 }
 
 function stubs(on: any, world: World, env: Record<string, string> = { HOME: '/home/u' }) {
@@ -52,13 +56,26 @@ function stubs(on: any, world: World, env: Record<string, string> = { HOME: '/ho
   on('tool.call', { tool: 'AskUserQuestion' }, ($: any, e: any) => {
     const questions = e.questions ?? e.input?.questions
     world.asks.push(questions[0].question)
+    world.menus.push(questions[0].options.map((o: any) => o.label))
     const answer = world.answers.shift()
+    const label = questions[0].options.find((o: any) => o.label.startsWith(answer ?? '\u0000'))?.label ?? answer
     return answer === undefined
       ? { deny: 'dismissed' }
-      : { result: { questions, answers: { [questions[0].question]: answer } } }
+      : { result: { questions, answers: { [questions[0].question]: label } } }
   })
   on('prompt.fill', ($: any, e: any) => { world.filled.push(e.text); return { isFilled: true } })
-  on('prompt.submit', ($: any, e: any) => ({ text: e.text }))
+  on('prompt.submit', ($: any, e: any) => {
+    if (e.origin?.kind === 'plugin') world.submitted.push(e.text)
+    return { text: e.text }
+  })
+  on('command.run', { command: 'clear' }, ($: any, e: any) => {
+    world.commands.push(e.command)
+    return { text: '' }
+  })
+  on('session.compact', ($: any, e: any) => {
+    world.compactions.push(e.instructions)
+    return { messages: [] }
+  })
   on('turn.start', ($: any, e: any) => ({ turnId: e.turnId }))
   on('turn.complete', ($: any, e: any) => ({ text: e.answer }))
   on('session.start', ($: any, e: any) => ({ cwd: e.cwd }))
@@ -66,7 +83,7 @@ function stubs(on: any, world: World, env: Record<string, string> = { HOME: '/ho
 }
 
 function world(partial: Partial<World> = {}): World {
-  return { asks: [], answers: [], filled: [], logs: [], forks: 0, forkRead: 0, transcript: '', subscriber: true, herdr: [], ...partial }
+  return { asks: [], answers: [], filled: [], logs: [], forks: 0, forkRead: 0, transcript: '', subscriber: true, herdr: [], menus: [], submitted: [], commands: [], compactions: [], ...partial }
 }
 
 /** One main-loop turn whose single request reads `read` cached tokens. */
@@ -216,4 +233,38 @@ test('inside herdr, the cache token shows a doomed session and clears when it is
   await turn($, on, 600_000, 't2')
   expect(w.herdr.at(-1)).toBe('--source cache-guard --agent claude --clear-token cache')
   expect(w.herdr.length).toBe(3)
+})
+
+test('the menu offers a new conversation, compaction and sending, priced', async ($, on) => {
+  const w = world({ transcript: row(T0 - 2 * 3_600_000, usage1h(600_000)), answers: [undefined] })
+  stubs(on, w)
+  await $.session.start({ cwd: '/work', surface: 'terminal', isInteractive: false })
+  await $.prompt.submit({ text: 'x', wait: false, origin: { kind: 'composer' } })
+  expect(w.menus[0]).toEqual(['Keep the prompt', 'New conversation (~$0)', 'Compact first (~$2.41)', 'Send anyway (~$4.82)'])
+})
+
+test('new conversation: /clear, then the prompt as its first', async ($, on) => {
+  const w = world({ transcript: row(T0 - 2 * 3_600_000, usage1h(600_000)), answers: ['New conversation'] })
+  const clock = stubs(on, w)
+  await $.session.start({ cwd: '/work', surface: 'terminal', isInteractive: false })
+  const held = await $.prompt.submit({ text: 'fresh start', wait: false, origin: { kind: 'composer' } })
+  expect(held.drop).toBe('Starting a new conversation with your prompt.')
+  await clock.settle()
+  expect(w.commands).toEqual(['clear'])
+  expect(w.submitted).toEqual(['fresh start'])
+})
+
+test('compact asks what the summary keeps; a failed compaction puts the prompt back', async ($, on) => {
+  // The test kit cannot run a compaction (no engine fills the messages), so this covers the
+  // failure path; compaction itself is checked live.
+  const w = world({ transcript: row(T0 - 2 * 3_600_000, usage1h(600_000)), answers: ['Compact first', 'Focus'] })
+  const clock = stubs(on, w)
+  await $.session.start({ cwd: '/work', surface: 'terminal', isInteractive: false })
+  const held = await $.prompt.submit({ text: 'fix the parser', wait: false, origin: { kind: 'composer' } })
+  expect(held.drop).toBe('Compacting, then sending your prompt.')
+  expect(w.menus[1]).toEqual(['Default summary', 'Focus on this prompt'])
+  await clock.settle()
+  expect(w.submitted).toEqual([])
+  expect(w.filled).toEqual(['fix the parser'])
+  expect(w.logs.at(-1)).toMatch(/your prompt is back in the box/)
 })
