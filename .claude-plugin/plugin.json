@@ -1,8 +1,17 @@
 {
   "name": "cache-guard",
-  "version": "0.1.0",
-  "description": "Keeps the prompt cache warm while you are away and asks before a prompt that would re-cache a large conversation.",
+  "version": "0.2.0",
+  "description": "Keeps the prompt cache warm while you are away, asks before a prompt that would re-cache a large conversation, and with Jev (TypeSafe) keeps the context lean: trims large tool output and compacts in about a second.",
   "author": { "name": "Spencer Boucher" },
   "repository": "https://github.com/justmytwospence/claude-cache-guard",
-  "license": "MIT"
+  "license": "MIT",
+  "userConfig": {
+    "typesafe_api_key": {
+      "type": "string",
+      "title": "TypeSafe API key",
+      "description": "For Jev, which trims tool output and compacts in about a second (https://console.typesafe.ai/keys). Leave empty to use TYPESAFE_API_KEY from the environment, or to go without Jev.",
+      "sensitive": true,
+      "required": false
+    }
+  }
 }

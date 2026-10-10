@@ -15,11 +15,18 @@
 // Warning: a prompt typed while idle onto an expired cache, when the rewrite would cost at least
 // warn.minCost at API prices, asks first; keeping it puts the text back in the prompt box.
 //
+// Lean context (with Jev, TypeSafe's judgment model, over its HTTP API): large tool output is
+// trimmed to the blocks the agent needs as its row is stored (`session.append`), so the model
+// never reads the rest and the prompt cache is never disturbed; and `session.compact` either
+// answers a summary written in code from Jev's verbatim/summarize/drop choices (the cold-cache
+// menu, /cache-guard compact) or filters what Claude Code's own summarizer reads (/compact and
+// automatic compaction). Without Jev none of that runs.
+//
 // The status line shows the cache itself (Claude Code's prompt_cache input), so this mod draws none.
 //
 // The host reads on(...) and $.noun.method(...) from source, so calls are spelled in full and
-// helpers that take $ are top-level functions in this file.
-import type { EngineInterface, On } from 'claude-code'
+// helpers that take $ are top-level functions in this file (jev.ts and units.ts are pure).
+import type { EngineInterface, On, PluginOptions, SessionCompactResult, SessionMessage } from 'claude-code'
 
 import {
   DEFAULT_SETTINGS,
@@ -45,8 +52,29 @@ import {
   warmDelayMs,
   worthWarning,
 } from './core'
+import { ENDPOINT, type JevState, type JevTarget, PROBE, describeFailure, label, readReply, requestBody, resolveJev } from './jev'
+import {
+  type Answer,
+  JEV_KEY_URL,
+  JEV_PITCH,
+  type Keep,
+  type Question,
+  type Unit,
+  batches,
+  blocksFor,
+  codeSummary,
+  keepAnswers,
+  keepCounts,
+  keepQuestions,
+  keepState,
+  trimQuestions,
+  trimState,
+  trimVerdict,
+  verbatimSection,
+} from './lean'
 import { settingsFiles } from './settings'
 import { parseTail, transcriptPath } from './transcript'
+import { extractUnits, fileOps, filterMessages, lastUserMessages, resultText, trimFloor, withResultText } from './units'
 
 const COMMAND = NAME
 const KEEP = 'Keep the prompt'
@@ -55,6 +83,23 @@ const COMPACT = 'Compact first'
 const SEND = 'Send anyway'
 const SUMMARY_DEFAULT = 'Default summary'
 const SUMMARY_FOCUS = 'Focus on this prompt'
+/** The compaction choices with Jev: its own, or Claude Code's summary (which Jev filters first). */
+const COMPACT_JEV = 'Compact with Jev'
+const SUMMARY_JEV_DEFAULT = 'Compact with a summary'
+const SUMMARY_JEV_FOCUS = 'Compact with a summary focused on this prompt'
+/** Under the cold-cache question while Jev is not set up (and not turned off). */
+export const JEV_TIP = 'Tip: /cache-guard jev sets up Jev, which compacts in about a second for ~$0 (or turns this tip off).'
+/** The /cache-guard jev and /cache-guard compact choices. */
+const JEV_DONE = 'Done'
+const JEV_ON = 'Turn Jev on'
+const JEV_LEAVE_OFF = 'Leave it off'
+const JEV_OFF = 'Turn Jev off'
+const JEV_OFF_TIPS = 'Turn Jev off (no more tips)'
+const JEV_SHOW_SETUP = 'Show the setup'
+const COMPACT_SUMMARY = "Compact with Claude Code's summary"
+const JEV_SETUP = 'Set up Jev'
+/** How many tool calls' inputs are remembered for their results (the rest trim without arguments). */
+const CALLS_REMEMBERED = 200
 /** How much of a transcript's end to read: enough for the last few responses. */
 const TAIL_BYTES = 400_000
 const TAIL_SCRIPT = 'f=$1; [ -f "$f" ] || f=$(ls "$2"/*/"$3" 2>/dev/null | head -n 1); [ -n "$f" ] && tail -c "$4" "$f"'
@@ -90,9 +135,37 @@ interface State {
   expiry?: { cancel: () => void }
   /** The `cache` token last reported to herdr; null before the first report. */
   herdrLast: string | undefined | null
+  /** The plugin's userConfig values (`typesafe_api_key`). */
+  options: PluginOptions
+  lean: Lean
 }
 
-export function register(on: On): void {
+/** The Jev parts: which Jev, what is armed, what was trimmed. */
+interface Lean {
+  jev: JevState
+  /** The settings the Jev state was resolved from, to resolve again when they change. */
+  jevKey: string
+  /** The next compaction is Jev's, written in code; strict: nothing is spent if Jev fails. */
+  armed?: { goal?: string }
+  /** Why the last Jev compaction did not run, if it did not. */
+  failure?: string
+  /** The last compaction this plugin's hook saw. */
+  last?: { mode: 'jev' | 'filtered' | 'plain'; counts?: Record<Keep, number>; latencyMs?: number }
+  /** How many compactions this plugin's hook has seen. */
+  compactions: number
+  /** Characters trimmed from tool output this session. */
+  saved: number
+  /** Tool+input keys trimmed this turn: asked again, the output comes whole. */
+  trimmedThisTurn: Set<string>
+  /** The main loop's tool calls in flight, by id: the name and input their result row is judged with. */
+  calls: Map<string, { tool: string; input: Record<string, unknown> }>
+  /** The current turn's request and the assistant's latest text: Jev's `intent` for a trim. */
+  turnText: { user: string; assistant: string }
+  /** A strict (armed) compaction is being judged: a failure must skip, not summarize. */
+  strictInFlight?: boolean
+}
+
+export function register(on: On, options: PluginOptions = {}): void {
   const s: State = {
     settings: DEFAULT_SETTINGS,
     sessionOn: true,
@@ -104,16 +177,27 @@ export function register(on: On): void {
     warms: 0,
     stopped: 'waiting for the first response',
     herdrLast: null,
+    options,
+    lean: {
+      jev: { kind: 'missing', reason: 'not checked yet' },
+      jevKey: '',
+      compactions: 0,
+      saved: 0,
+      trimmedThisTurn: new Set(),
+      calls: new Map(),
+      turnText: { user: '', assistant: '' },
+    },
   }
 
   on('session.start', async ($, e, next) => {
     const result = await next(e)
     s.interactive = e.isInteractive
     s.settings = await loadSettings($)
+    await refreshJev($, s)
     await $.command.register({
       name: COMMAND,
-      description: 'cache-guard: prompt cache status, warm (refresh now), on, or off (this session)',
-      argumentHint: '[status|warm|on|off]',
+      description: 'cache-guard: prompt cache status, warm (refresh now), on/off (this session), compact [focus] (with Jev), jev (set up or check Jev)',
+      argumentHint: '[status|warm|on|off|compact [focus]|jev]',
       immediate: true,
     })
     // A resumed session: its last response and TTL come from the transcript.
@@ -147,6 +231,11 @@ export function register(on: On): void {
 
   on('turn.start', async ($, e, next) => {
     s.busy = true
+    s.lean.turnText = { user: e.text, assistant: '' }
+    s.lean.trimmedThisTurn.clear()
+    s.lean.calls.clear()
+    // Settings edited since (a key added, trimming turned off) apply from the next turn.
+    s.settings = await loadSettings($)
     return next(e)
   })
 
@@ -173,6 +262,7 @@ export function register(on: On): void {
       if (usage && prompt > 0) {
         s.clock = { lastAt: startedAt, lastRealAt: startedAt, promptTokens: prompt, tokens: prompt + usage.output_tokens, model: usage.model }
       }
+      if (result.answer.trim()) s.lean.turnText.assistant = result.answer
       return result
     } finally {
       s.stepsInFlight--
@@ -181,17 +271,141 @@ export function register(on: On): void {
     }
   })
 
+  // Every main-loop tool call: its name and input, for the trim of its result row.
+  on('tool.call', async ($, e, next) => {
+    if (e.agentId === undefined && typeof e.tool_use_id === 'string') {
+      const { tool, tool_use_id, agentId: _agentId, consent: _consent, ...input } = e as Record<string, unknown> & { tool: string; tool_use_id: string }
+      if (s.lean.calls.size >= CALLS_REMEMBERED) s.lean.calls.delete(s.lean.calls.keys().next().value as string)
+      s.lean.calls.set(tool_use_id, { tool, input })
+    }
+    return next(e)
+  }).catch(($, e, next) => (next.called ? undefined : next(e)))
+
+  // A tool result about to be stored: trimmed to the blocks the agent needs, before the model reads
+  // it. Main loop only: a subagent's transcript is its own and is dropped when it finishes.
+  on('session.append', { door: 'tool-result' }, async ($, e, next) => {
+    if (e.agentId !== undefined || !s.settings.enabled || !s.settings.trim.enabled) return next(e)
+    const index = e.message.content.findIndex((block) => block.type === 'tool_result')
+    const block = e.message.content[index]
+    if (!block) return next(e)
+    const id = String(block.tool_use_id ?? '')
+    const call = s.lean.calls.get(id)
+    const tool = call?.tool ?? (e.origin.kind === 'tool' ? e.origin.tool : '')
+    const floor = trimFloor(tool, s.settings.trim)
+    if (floor === undefined || block.is_error === true) return next(e)
+    const text = resultText(block.content)
+    if (text.length <= floor) return next(e)
+    // The agent asked again for something already trimmed this turn: give it everything.
+    const key = call ? `${tool}:${JSON.stringify(call.input)}` : undefined
+    if (key !== undefined && s.lean.trimmedThisTurn.has(key)) return next(e)
+    const jev = await currentJev($, s)
+    if (jev.kind !== 'ready') return next(e)
+
+    const { lines, blocks } = blocksFor(text, s.settings.trim)
+    const state = trimState({ user_request: s.lean.turnText.user, agent_said: s.lean.turnText.assistant, tool, arguments: JSON.stringify(call?.input ?? {}) }, blocks)
+    const outcome = await askJev($, jev.target, s.settings.jev.timeoutMs, state, trimQuestions(blocks))
+    if (!outcome.ok) {
+      $.ui.log(`${tool} output not trimmed: Jev ${outcome.reason}`, { to: 'debug' })
+      return next(e)
+    }
+    const fullPath = await outputPath($, s, id)
+    const verdict = trimVerdict(lines, blocks, outcome.answers, s.settings.trim, fullPath)
+    if (!verdict.trim) {
+      $.ui.log(`${tool} output kept whole (${verdict.totalLines} lines; needs all: ${verdict.needsAll.toFixed(2)}, would keep ${verdict.keptLines}; Jev ${outcome.latencyMs} ms)`, { to: 'debug' })
+      return next(e)
+    }
+    try {
+      await $.fs.write(fullPath, text)
+    } catch (error) {
+      $.ui.log(`${tool} output not trimmed: could not save it to ${fullPath} (${error instanceof Error ? error.message : String(error)})`, { to: 'debug' })
+      return next(e)
+    }
+    if (key !== undefined) s.lean.trimmedThisTurn.add(key)
+    s.lean.saved += text.length - verdict.text.length
+    $.ui.log(`trimmed ${tool} output to ${verdict.keptLines} of ${verdict.totalLines} lines (Jev, ${outcome.latencyMs} ms); full output: ${fullPath}`)
+    const content = e.message.content.map((b, i) => (i === index ? { ...b, content: withResultText(b.content, verdict.text) } : b))
+    return next({ ...e, message: { ...e.message, content } })
+  }).catch(($, e, next) => (next.called ? undefined : next(e)))
+
+  // Compaction: Jev's own when armed (strict: a Jev failure skips it, so nothing is spent), else
+  // Claude Code's summarizer over what Jev did not drop, plus the verbatim items.
+  on('session.compact', async ($, e, next) => {
+    if (e.agentId !== undefined || e.trigger === 'precompute') return next(e)
+    const request = s.lean.armed
+    s.lean.armed = undefined
+    s.lean.failure = undefined
+    s.lean.compactions++
+    const jevOnly = request !== undefined
+    s.lean.strictInFlight = jevOnly
+    s.lean.last = { mode: 'plain' }
+    // A Jev problem: an armed compaction is skipped (strict), any other runs as it would have.
+    const fail = (reason: string): SessionCompactResult | Promise<SessionCompactResult> => {
+      s.lean.failure = reason
+      s.lean.strictInFlight = false
+      return jevOnly ? { skip: `Jev compaction: ${reason}` } : next(e)
+    }
+    if (!s.settings.enabled) return fail('cache-guard is off')
+    if (!jevOnly && !s.settings.compact.filter) return next(e)
+    const jev = await currentJev($, s)
+    if (jev.kind !== 'ready') return fail(jev.kind === 'off' ? 'Jev is off' : `Jev is not set up (${jev.reason})`)
+    const { units, previousSummary } = extractUnits(e.messages)
+    if (!units.length) return fail('nothing for Jev to judge')
+    const goal = request?.goal?.trim() || e.instructions?.trim() || lastUserMessages(e.messages, 2)
+    const judged = await judgeUnits($, s, jev.target, units, goal)
+    if (!judged.ok) return fail(judged.reason)
+    const { keep } = judged
+    const counts = keepCounts(keep)
+
+    if (jevOnly) {
+      const summary = codeSummary({ units, keep, previousSummary, fileOps: fileOps(e.messages), instructions: request?.goal ?? e.instructions })
+      s.lean.last = { mode: 'jev', counts, latencyMs: judged.latencyMs }
+      s.lean.strictInFlight = false
+      return { messages: [{ role: 'user', text: summary, toolUses: [] }] }
+    }
+
+    let filtered: SessionMessage[]
+    try {
+      filtered = filterMessages(e.messages, units, keep) as SessionMessage[]
+    } catch (error) {
+      return fail(`filtering failed (${error instanceof Error ? error.message : String(error)})`)
+    }
+    s.lean.last = { mode: 'filtered', counts, latencyMs: judged.latencyMs }
+    const result = await next({ ...e, messages: filtered })
+    if (result.skip !== undefined) return result
+    const verbatim = verbatimSection(units, keep)
+    if (!verbatim) return result
+    // One more user message after the summary (the summary's own row is the engine's).
+    return { ...result, messages: [...result.messages, { role: 'user', text: verbatim, toolUses: [] }] }
+  }).catch(($, e, next) => {
+    if (next.called) return undefined
+    if (!s.lean.strictInFlight) return next(e)
+    // Armed and failed before answering: strict, so nothing is spent.
+    s.lean.strictInFlight = false
+    s.lean.failure = `Jev compaction failed (${next.error.message})`
+    return { skip: s.lean.failure }
+  })
+
   on('prompt.submit', async ($, e, next) => {
     if (!s.sessionOn || e.origin.kind !== 'composer' || e.turnId !== undefined) return next(e)
     const text = e.text.trim()
     if (!text || text.startsWith('/')) return next(e)
     const miss = await assess($, s)
     if (!miss) return next(e)
-    // Keep first, so a reflexive Enter (or Esc) spends nothing; then cheapest to dearest.
-    const labels = { keep: KEEP, fresh: `${FRESH} (~$0)`, compact: `${COMPACT} (~${formatCost(miss.costs.compact)})`, send: `${SEND} (~${formatCost(miss.costs.send)})` }
+    const jev = await currentJev($, s)
+    const ready = jev.kind === 'ready'
+    // Keep first, so a reflexive Enter (or Esc) spends nothing; then cheapest to dearest. The dialog
+    // takes four options, so with Jev the two compactions are the next question's.
+    const compactCost = `${s.settings.compact.filter && ready ? 'up to ' : ''}~${formatCost(miss.costs.compact)}`
+    const labels = {
+      keep: KEEP,
+      fresh: `${FRESH} (~$0)`,
+      compact: ready ? `${COMPACT} (~$0 with Jev)` : `${COMPACT} (~${formatCost(miss.costs.compact)})`,
+      send: `${SEND} (~${formatCost(miss.costs.send)})`,
+    }
+    const tip = jev.kind === 'missing' ? `\n${JEV_TIP}` : ''
     let answer: string | undefined
     try {
-      answer = await $.ui.ask(`Prompt cache miss. ${miss.line} What now?`, { header: 'Cache', options: [labels.keep, labels.fresh, labels.compact, labels.send] })
+      answer = await $.ui.ask(`Prompt cache miss. ${miss.line} What now?${tip}`, { header: 'Cache', options: [labels.keep, labels.fresh, labels.compact, labels.send] })
     } catch {
       answer = undefined // dismissed: keep it
     }
@@ -203,14 +417,27 @@ export function register(on: On): void {
       return { drop: 'Starting a new conversation with your prompt.' }
     }
     if (answer === labels.compact) {
+      const jevLabel = `${COMPACT_JEV} (~1s, ~$0)`
+      const plainLabel = ready ? `${SUMMARY_JEV_DEFAULT} (${compactCost})` : SUMMARY_DEFAULT
+      const focusLabel = ready ? `${SUMMARY_JEV_FOCUS} (${compactCost})` : SUMMARY_FOCUS
+      const choices = ready ? [jevLabel, plainLabel, focusLabel] : [plainLabel, focusLabel]
+      const question = ready
+        ? 'Compact how? Jev judges the history against your prompt and writes the summary in code, in about a second. (Type your own guidance for a summary under Other.)'
+        : 'What should the summary keep? (Type your own guidance under Other.)'
       let how: string | undefined
       try {
-        how = await $.ui.ask('What should the summary keep? (Type your own guidance under Other.)', { header: 'Compact', options: [SUMMARY_DEFAULT, SUMMARY_FOCUS] })
+        how = await $.ui.ask(question, { header: 'Compact', options: choices })
       } catch {
         how = undefined
       }
+      if (how === jevLabel) {
+        $.clock.after(0, () => {
+          void compactWithJevThenSend($, s, e.text)
+        })
+        return { drop: 'Compacting with Jev, then sending your prompt.' }
+      }
       if (how !== undefined) {
-        const instructions = how === SUMMARY_DEFAULT ? undefined : how === SUMMARY_FOCUS ? compactionFocus(e.text) : how
+        const instructions = how === plainLabel ? undefined : how === focusLabel ? compactionFocus(e.text) : how
         $.clock.after(0, () => {
           void compactThenSend($, s, e.text, instructions)
         })
@@ -223,6 +450,9 @@ export function register(on: On): void {
 
   on('command.run', { command: COMMAND }, async ($, e) => {
     const arg = e.args.trim()
+    const word = arg.split(/\s+/u)[0] ?? ''
+    if (word === 'jev') return { text: await jevCommand($, s) }
+    if (word === 'compact') return { text: await compactCommand($, s, arg.slice(word.length).trim()) }
     if (arg === 'on' || arg === 'off') {
       s.sessionOn = arg === 'on'
       if (s.sessionOn) await schedule($, s)
@@ -253,6 +483,274 @@ async function loadSettings($: EngineInterface): Promise<Settings> {
     texts.push(await $.fs.read(file).catch(() => undefined))
   }
   return mergeSettings(DEFAULT_SETTINGS, texts)
+}
+
+/** `~/.claude/cache-guard.json`: the Claude Code user file, which `/cache-guard jev` writes. */
+async function userSettingsFile($: EngineInterface): Promise<string> {
+  const home = (await $.env.get('HOME')) ?? ''
+  return `${home}/.claude/${NAME}.json`
+}
+
+/**
+ * Merges `patch` into the user settings file (objects merge, other values replace). Refuses, with
+ * the reason, when the file exists but is not a JSON object, rather than overwrite it.
+ */
+async function saveUserSettings($: EngineInterface, patch: Record<string, unknown>): Promise<string | undefined> {
+  const file = await userSettingsFile($)
+  let current: Record<string, unknown> = {}
+  const text = await $.fs.read(file).catch(() => undefined)
+  if (text !== undefined && text.trim()) {
+    let value: unknown
+    try {
+      value = JSON.parse(text)
+    } catch {
+      return `${file} is not valid JSON; fix it by hand`
+    }
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) return `${file} is not a JSON object; fix it by hand`
+    current = value as Record<string, unknown>
+  }
+  try {
+    await $.fs.write(file, `${JSON.stringify(mergeObjects(current, patch), null, 2)}\n`)
+  } catch (error) {
+    return `could not write ${file} (${error instanceof Error ? error.message : String(error)})`
+  }
+  return undefined
+}
+
+function mergeObjects(base: Record<string, unknown>, over: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...base }
+  for (const [key, value] of Object.entries(over)) {
+    const current = out[key]
+    out[key] = isRecord(current) && isRecord(value) ? mergeObjects(current, value) : value
+  }
+  return out
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Jev
+
+/** Resolves which Jev to use from the settings and the key found; the state is kept on `s`. */
+async function refreshJev($: EngineInterface, s: State): Promise<JevState> {
+  s.lean.jevKey = JSON.stringify([s.settings.enabled, s.settings.jev])
+  s.lean.jev = resolveJev(s.settings, s.options.typesafe_api_key, await $.env.get('TYPESAFE_API_KEY'))
+  return s.lean.jev
+}
+
+/** Jev as last resolved, resolved again when the settings changed since. */
+async function currentJev($: EngineInterface, s: State): Promise<JevState> {
+  if (s.lean.jevKey !== JSON.stringify([s.settings.enabled, s.settings.jev])) await refreshJev($, s)
+  return s.lean.jev
+}
+
+type JevOutcome =
+  | { ok: true; answers: Record<string, Answer>; latencyMs: number; inputTokens?: number }
+  | { ok: false; reason: string }
+
+/** One Jev request over TypeSafe's API. Never throws: every failure is `{ ok: false, reason }`. */
+async function askJev($: EngineInterface, target: JevTarget, timeoutMs: number, state: Record<string, unknown>, questions: Record<string, Question>): Promise<JevOutcome> {
+  const started = await $.clock.now()
+  let timer: { cancel: () => void } | undefined
+  const timeout = new Promise<string>((resolve) => {
+    timer = $.clock.after(timeoutMs, () => resolve('timed out'))
+  })
+  const request = $.http
+    .fetch(ENDPOINT, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${target.apiKey}`, 'content-type': 'application/json' },
+      body: requestBody(target.model, state, questions),
+    })
+    .then(
+      (response) => response,
+      (error: unknown) => describeFailure(undefined, error instanceof Error ? error.message : String(error)),
+    )
+  const response = await Promise.race([request, timeout])
+  timer?.cancel()
+  if (typeof response === 'string') return { ok: false, reason: response }
+  if (!response.ok) return { ok: false, reason: describeFailure(response.status) }
+  const reply = readReply(response.text)
+  if (!reply) return { ok: false, reason: 'unreadable response' }
+  return { ok: true, answers: reply.answers, latencyMs: (await $.clock.now()) - started, ...(reply.inputTokens !== undefined ? { inputTokens: reply.inputTokens } : {}) }
+}
+
+/** Jev's verdict on every unit, in batches, `compact.concurrency` requests at a time. */
+async function judgeUnits($: EngineInterface, s: State, target: JevTarget, units: Unit[], goal: string): Promise<{ ok: true; keep: Map<string, Keep>; latencyMs: number } | { ok: false; reason: string }> {
+  const started = await $.clock.now()
+  const keep = new Map<string, Keep>()
+  const queue = batches(units)
+  let reason: string | undefined
+  const worker = async () => {
+    for (let batch = queue.shift(); batch && !reason; batch = queue.shift()) {
+      const outcome = await askJev($, target, s.settings.compact.timeoutMs, keepState(goal, batch), keepQuestions(batch))
+      if (!outcome.ok) {
+        reason = outcome.reason
+        return
+      }
+      keepAnswers(batch, outcome.answers, keep)
+    }
+  }
+  await Promise.all(Array.from({ length: Math.max(1, Math.floor(s.settings.compact.concurrency)) }, worker))
+  if (reason) return { ok: false, reason: `Jev failed (${reason})` }
+  return { ok: true, keep, latencyMs: (await $.clock.now()) - started }
+}
+
+/** Where a trimmed tool result's full output is saved. */
+async function outputPath($: EngineInterface, s: State, toolUseId: string): Promise<string> {
+  const home = (await $.env.get('HOME')) ?? ''
+  const configDir = (await $.env.get('CLAUDE_CONFIG_DIR')) || `${home}/.claude`
+  const session = (await $.session.id().catch(() => 'session')) || 'session'
+  const safe = (text: string) => text.replace(/[^\w.-]/gu, '_')
+  return `${configDir}/${NAME}/tool-output/${safe(session)}/${safe(toolUseId)}.txt`
+}
+
+/** The Jev line of /cache-guard status. */
+function jevLine(s: State): string {
+  const jev = s.lean.jev
+  if (jev.kind === 'off') return 'Jev: off (/cache-guard jev turns it on).'
+  if (jev.kind === 'missing') return `Jev: not set up (${jev.reason}); /cache-guard jev.`
+  const saved = s.lean.saved > 0 ? ` (−${Math.round(s.lean.saved / 4_000)}k tokens so far)` : ''
+  const trim = s.settings.trim.enabled ? `trimming on${saved}` : 'trimming off'
+  const compaction = `Jev compaction from the cold-cache menu and /cache-guard compact${s.settings.compact.filter ? '; it filters /compact too' : ''}`
+  return `Jev: ${label(jev.target)} (key from ${jev.target.keySource}); ${trim}; ${compaction}.`
+}
+
+/** How to set Jev up, for /cache-guard jev and the tip. */
+function jevSetupText(): string {
+  return [
+    JEV_PITCH,
+    `It needs a TypeSafe API key from ${JEV_KEY_URL}. Either set the plugin option (kept in secure storage, not settings.json):`,
+    `  /plugin configure ${NAME}@inline  (${NAME}@<marketplace> when installed from one), or in a shell`,
+    `  echo '{"typesafe_api_key": "<key>"}' | claude plugin configure ${NAME}@inline --values-stdin`,
+    'then restart Claude Code; or export TYPESAFE_API_KEY before starting it. /cache-guard jev checks it.',
+  ].join('\n')
+}
+
+/** `/cache-guard jev`: whether Jev is set up and answers; or how to set it up; on or off. */
+async function jevCommand($: EngineInterface, s: State): Promise<string> {
+  s.settings = await loadSettings($)
+  if (!s.settings.enabled) return 'cache-guard is off in its settings ("enabled": false), Jev included.'
+  const ask = async (question: string, options: string[]): Promise<string | undefined> => {
+    try {
+      return await $.ui.ask(question, { header: 'Jev', options })
+    } catch {
+      return undefined
+    }
+  }
+  const turnOff = async (): Promise<string> => {
+    const problem = await saveUserSettings($, { jev: { enabled: false } })
+    if (problem) return `Could not save the setting: ${problem}`
+    s.settings = await loadSettings($)
+    await refreshJev($, s)
+    return 'Jev is off: no trimming, no Jev compaction, no tips. /cache-guard jev turns it back on.'
+  }
+  if (!s.settings.jev.enabled) {
+    const pick = await ask(`Jev is off: no trimming, no Jev compaction, no tips. Turn it on?\n${JEV_PITCH}`, [JEV_ON, JEV_LEAVE_OFF])
+    if (pick !== JEV_ON) return 'Jev stays off.'
+    const problem = await saveUserSettings($, { jev: { enabled: true } })
+    if (problem) return `Could not save the setting: ${problem}`
+    s.settings = await loadSettings($)
+  }
+  const state = await refreshJev($, s)
+  if (state.kind === 'ready') {
+    const answer = await askJev($, state.target, 10_000, PROBE.state, PROBE.questions)
+    const head = answer.ok
+      ? `Jev: ${label(state.target)} (key from ${state.target.keySource}), answered in ${answer.latencyMs} ms.`
+      : `Jev: ${label(state.target)} (key from ${state.target.keySource}) did not answer (${answer.reason}).`
+    const pick = await ask(`${head} It trims large tool output and compacts in about a second (the cold-cache menu, /cache-guard compact).`, [JEV_DONE, JEV_OFF, JEV_SHOW_SETUP])
+    if (pick === JEV_OFF) return turnOff()
+    if (pick === JEV_SHOW_SETUP) return `${head}\n${jevSetupText()}`
+    return head
+  }
+  if (state.kind === 'off') return 'Jev is off.'
+  const text = `Jev is not set up: ${state.reason}.\n${jevSetupText()}`
+  const pick = await ask(`${text}\nWhat now?`, [JEV_DONE, JEV_OFF_TIPS])
+  if (pick === JEV_OFF_TIPS) return turnOff()
+  return text
+}
+
+/** `/cache-guard compact [focus]`: Jev's compaction, written in code; nothing is spent if Jev fails. */
+async function compactCommand($: EngineInterface, s: State, focus: string): Promise<string> {
+  const jev = await currentJev($, s)
+  if (jev.kind !== 'ready') {
+    const why = jev.kind === 'off' ? 'Jev is off' : `Jev is not set up (${jev.reason})`
+    let pick: string | undefined
+    try {
+      pick = await $.ui.ask(`${why}. Compact with Claude Code's summary instead?`, { header: 'Compact', options: [COMPACT_SUMMARY, JEV_SETUP] })
+    } catch {
+      pick = undefined
+    }
+    if (pick === JEV_SETUP) return jevCommand($, s)
+    if (pick !== COMPACT_SUMMARY) return `${why}; nothing compacted.`
+    $.clock.after(0, () => {
+      void runCompaction($, s, focus || undefined).then((outcome) => {
+        $.ui.log(outcome.ok ? 'compacted' : `compaction did not run (${outcome.reason})`)
+      })
+    })
+    return 'Compacting with a summary.'
+  }
+  $.clock.after(0, () => {
+    void runJevCompaction($, s, focus || undefined).then((outcome) => {
+      $.ui.log(outcome.ok ? `compacted with Jev in ${(outcome.latencyMs / 1000).toFixed(1)} s (${describeCounts(outcome.counts)})` : `compaction with Jev did not run: ${outcome.reason}`)
+    })
+  })
+  return 'Compacting with Jev.'
+}
+
+function describeCounts(counts: Record<Keep, number> | undefined): string {
+  if (!counts) return 'no counts'
+  return `${counts.verbatim} kept verbatim, ${counts.summarize} noted, ${counts.drop} dropped`
+}
+
+type CompactionOutcome = { ok: true; latencyMs: number; counts?: Record<Keep, number> } | { ok: false; reason: string }
+
+/**
+ * A Jev compaction of the main conversation: armed, then `/compact` run as the person would, which
+ * reaches this plugin's own `session.compact` hook (a plugin's `$.session.compact` skips its own
+ * hooks). Strict: if the hook skipped, or never ran, nothing was spent.
+ */
+async function runJevCompaction($: EngineInterface, s: State, goal: string | undefined): Promise<CompactionOutcome> {
+  s.lean.armed = { goal }
+  s.lean.failure = undefined
+  const started = await $.clock.now()
+  try {
+    await $.command.run({ command: 'compact' })
+  } catch (error) {
+    s.lean.armed = undefined
+    return { ok: false, reason: s.lean.failure ?? (error instanceof Error ? error.message : String(error)) }
+  }
+  if (s.lean.armed) {
+    s.lean.armed = undefined
+    return { ok: false, reason: 'the compaction did not reach cache-guard (another plugin answered session.compact first?)' }
+  }
+  if (s.lean.failure) return { ok: false, reason: s.lean.failure }
+  if (s.lean.last?.mode !== 'jev') return { ok: false, reason: 'the compaction was not Jev\'s' }
+  s.clock = undefined
+  return { ok: true, latencyMs: (await $.clock.now()) - started, counts: s.lean.last.counts }
+}
+
+/**
+ * Claude Code's own compaction (with the guidance), run as `/compact` so that this plugin's hook
+ * filters it with Jev. It counted as done when the transcript got shorter.
+ */
+async function runCompaction($: EngineInterface, s: State, instructions: string | undefined): Promise<CompactionOutcome> {
+  s.lean.armed = undefined
+  const before = await $.session.messages().then((m) => m.length, () => undefined)
+  const seen = s.lean.compactions
+  const started = await $.clock.now()
+  try {
+    await $.command.run({ command: 'compact', ...(instructions ? { args: instructions } : {}) })
+  } catch (error) {
+    return { ok: false, reason: error instanceof Error ? error.message : String(error) }
+  }
+  const after = await $.session.messages().then((m) => m.length, () => undefined)
+  if (before !== undefined && after !== undefined && after >= before) {
+    return { ok: false, reason: s.lean.compactions > seen ? 'the conversation is unchanged (skipped, or too small)' : 'nothing compacted' }
+  }
+  s.clock = undefined
+  return { ok: true, latencyMs: (await $.clock.now()) - started, counts: s.lean.last?.counts }
 }
 
 /**
@@ -412,6 +910,8 @@ async function status($: EngineInterface, s: State): Promise<string> {
   const on = s.sessionOn && s.settings.enabled
   lines.push(`Keep-warm: ${on && s.settings.warm.enabled ? (s.timer ? 'next refresh scheduled' : `idle (${s.stopped || 'nothing to keep'})`) : 'off'}.`)
   lines.push(`Warning: ${on && s.settings.warn.enabled ? `on, from ${formatCost(s.settings.warn.minCost)} at API prices` : 'off'}.`)
+  await currentJev($, s)
+  lines.push(jevLine(s))
   return lines.join('\n')
 }
 
@@ -465,17 +965,29 @@ async function startFresh($: EngineInterface, s: State, text: string): Promise<v
 
 /** Compaction (with the chosen guidance), then the held prompt onto the summary. */
 async function compactThenSend($: EngineInterface, s: State, text: string, instructions: string | undefined): Promise<void> {
-  try {
-    const result = await $.session.compact(instructions ? { instructions } : {})
-    if ('skip' in result && typeof result.skip === 'string') {
-      $.ui.log(`compaction was skipped (${result.skip}); your prompt is back in the box`)
-      await $.prompt.fill({ text })
-      return
-    }
-    s.clock = undefined
-    await $.prompt.submit({ text, asUser: true })
-  } catch (error) {
-    $.ui.log(`compaction failed (${error instanceof Error ? error.message : String(error)}); your prompt is back in the box`)
+  const outcome = await runCompaction($, s, instructions)
+  if (!outcome.ok) {
+    $.ui.log(`compaction did not run (${outcome.reason}); your prompt is back in the box`)
     await $.prompt.fill({ text })
+    return
   }
+  await $.prompt.submit({ text, asUser: true }).catch(async (error: unknown) => {
+    $.ui.log(`could not send your prompt (${error instanceof Error ? error.message : String(error)}); it is back in the box`)
+    await $.prompt.fill({ text })
+  })
+}
+
+/** A Jev compaction judged against the held prompt, then the prompt onto the summary; on failure the prompt goes back. */
+async function compactWithJevThenSend($: EngineInterface, s: State, text: string): Promise<void> {
+  const outcome = await runJevCompaction($, s, text)
+  if (!outcome.ok) {
+    $.ui.log(`compaction with Jev did not run: ${outcome.reason}; your prompt is back in the box`)
+    await $.prompt.fill({ text })
+    return
+  }
+  $.ui.log(`compacted with Jev in ${(outcome.latencyMs / 1000).toFixed(1)} s (${describeCounts(outcome.counts)})`)
+  await $.prompt.submit({ text, asUser: true }).catch(async (error: unknown) => {
+    $.ui.log(`could not send your prompt (${error instanceof Error ? error.message : String(error)}); it is back in the box`)
+    await $.prompt.fill({ text })
+  })
 }
