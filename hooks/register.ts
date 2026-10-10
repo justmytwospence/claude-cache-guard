@@ -74,7 +74,7 @@ import {
 } from './lean'
 import { settingsFiles } from './settings'
 import { parseTail, transcriptPath } from './transcript'
-import { extractUnits, fileOps, filterMessages, lastUserMessages, resultText, trimFloor, withResultText } from './units'
+import { extractUnits, fileOps, filterMessages, lastUserMessages, persistedPath, resultText, trimFloor, withResultText } from './units'
 
 const COMMAND = NAME
 const KEEP = 'Keep the prompt'
@@ -293,8 +293,11 @@ export function register(on: On, options: PluginOptions = {}): void {
     const tool = call?.tool ?? (e.origin.kind === 'tool' ? e.origin.tool : '')
     const floor = trimFloor(tool, s.settings.trim)
     if (floor === undefined || block.is_error === true) return next(e)
-    const text = resultText(block.content)
-    if (text.length <= floor) return next(e)
+    // Claude Code put a large result in a file and left a preview: trim the whole of it instead.
+    const shown = resultText(block.content)
+    const persisted = persistedPath(shown)
+    const text = persisted ? await readPersisted($, persisted) : shown
+    if (text === undefined || text.length <= floor) return next(e)
     // The agent asked again for something already trimmed this turn: give it everything.
     const key = call ? `${tool}:${JSON.stringify(call.input)}` : undefined
     if (key !== undefined && s.lean.trimmedThisTurn.has(key)) return next(e)
@@ -308,14 +311,14 @@ export function register(on: On, options: PluginOptions = {}): void {
       $.ui.log(`${tool} output not trimmed: Jev ${outcome.reason}`, { to: 'debug' })
       return next(e)
     }
-    const fullPath = await outputPath($, s, id)
+    const fullPath = persisted ?? (await outputPath($, s, id))
     const verdict = trimVerdict(lines, blocks, outcome.answers, s.settings.trim, fullPath)
     if (!verdict.trim) {
       $.ui.log(`${tool} output kept whole (${verdict.totalLines} lines; needs all: ${verdict.needsAll.toFixed(2)}, would keep ${verdict.keptLines}; Jev ${outcome.latencyMs} ms)`, { to: 'debug' })
       return next(e)
     }
     try {
-      await $.fs.write(fullPath, text)
+      if (!persisted) await $.fs.write(fullPath, text)
     } catch (error) {
       $.ui.log(`${tool} output not trimmed: could not save it to ${fullPath} (${error instanceof Error ? error.message : String(error)})`, { to: 'debug' })
       return next(e)
@@ -990,4 +993,10 @@ async function compactWithJevThenSend($: EngineInterface, s: State, text: string
     $.ui.log(`could not send your prompt (${error instanceof Error ? error.message : String(error)}); it is back in the box`)
     await $.prompt.fill({ text })
   })
+}
+
+/** A result Claude Code persisted, when it is still there and at most 8 MB. */
+async function readPersisted($: EngineInterface, file: string): Promise<string | undefined> {
+  const text = await $.fs.read(file).catch(() => undefined)
+  return typeof text === 'string' && text.length <= 8_000_000 ? text : undefined
 }

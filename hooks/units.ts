@@ -164,6 +164,15 @@ export function trimFloor(tool: string, limits: { minChars: number; readMinChars
   return undefined
 }
 
+/**
+ * Where Claude Code saved a result too large for the context: its `<persisted-output>` row keeps
+ * only a 2 KB preview and this path. Undefined for an ordinary result.
+ */
+export function persistedPath(text: string): string | undefined {
+  const match = /^<persisted-output>\s*\nOutput too large \([^)]*\)\. Full output saved to: (\S+)/u.exec(text)
+  return match?.[1]
+}
+
 /** The text of a tool_result block's `content`: a string, or its text blocks joined. */
 export function resultText(content: unknown): string {
   if (typeof content === 'string') return content

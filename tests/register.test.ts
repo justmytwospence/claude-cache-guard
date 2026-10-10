@@ -420,6 +420,22 @@ test('trims a large Bash result with Jev, saves the full output, and gives it wh
   expect(status.text).toMatch(/Jev: typesafe\/jev-latest \(key from TYPESAFE_API_KEY\); trimming on \(−\d+k tokens so far\); Jev compaction from the cold-cache menu and \/cache-guard compact; it filters \/compact too\./)
 })
 
+test('a result Claude Code persisted to a file is trimmed from that file, which stays the full output', async ($, on) => {
+  const w = world({ transcript: row(T0, usage1h(600_000)) })
+  stubs(on, w, JEV_ENV)
+  await $.session.start({ cwd: '/work', surface: 'terminal', isInteractive: false })
+  await $.turn.start({ text: 'run the tests and fix what fails', turnId: 't1' })
+  await $.tool.call({ tool: 'Bash', command: 'npm test', tool_use_id: 'p1' } as any)
+  const log = buildLog()
+  w.files['/home/u/.claude/projects/x/tool-results/abc.txt'] = log
+  const preview = `<persisted-output>\nOutput too large (83.9KB). Full output saved to: /home/u/.claude/projects/x/tool-results/abc.txt\n\nPreview (first 2KB):\n${log.slice(0, 2000)}\n...\n</persisted-output>`
+  const stored = await $.session.append(toolResultRow('p1', 'Bash', preview) as any)
+  const text = stored.message!.content[0]!.content as string
+  expect(text).toMatch(/FAIL src\/parser\.test\.ts > skips blank lines/)
+  expect(text).toMatch(/Full output: \/home\/u\/\.claude\/projects\/x\/tool-results\/abc\.txt/)
+  expect(w.files['/home/u/.claude/cache-guard/tool-output/sid/p1.txt']).toBeUndefined()
+})
+
 test('a Jev that times out, errors, or wants the whole output leaves the result alone; a subagent is never trimmed', async ($, on) => {
   const w = world({ transcript: row(T0, usage1h(600_000)), jev: () => null })
   const clock = stubs(on, w, JEV_ENV)
