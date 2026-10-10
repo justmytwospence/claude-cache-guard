@@ -1,6 +1,7 @@
-// cache-guard core: the prompt-cache clock, the cost of a miss, and when a keep-warm request or a
-// warning pays. Shared verbatim by pi-cache-guard, claude-cache-guard, opencode-cache-guard and
-// codex-cache-guard; keep it free of harness imports so each port can copy this file as is.
+// cache-guard core: the prompt-cache clock, the cost of a miss, when a keep-warm request or a
+// warning pays, and the settings of every part (`lean.ts` holds the Jev trimming and compaction).
+// Shared verbatim by pi-cache-guard, claude-cache-guard, opencode-cache-guard and
+// codex-cache-guard; keep it free of imports so each port can copy this file as is.
 //
 // The model is Anthropic's: a cached prefix lives for its TTL from the start of the last request
 // that read or wrote it (the API guarantees that minimum and deletes soon after), and a request
@@ -46,6 +47,44 @@ export interface Settings {
     /** Report the pane token `cache` to herdr (inside a herdr pane) so its agents sidebar can show doomed sessions. */
     enabled: boolean;
   };
+  jev: {
+    /** Use Jev, TypeSafe's judgment model, to trim tool output and to compact. Off: neither, and no setup hints. */
+    enabled: boolean;
+    /** Where to reach Jev. Empty: the first that works (Pi: any provider that serves Jev; elsewhere TypeSafe's API). */
+    provider: string;
+    /** Jev's model id at that provider. Empty: the provider's default. */
+    model: string;
+    /** One trimming request's limit, in milliseconds; past it the output stays whole. */
+    timeoutMs: number;
+  };
+  trim: {
+    /** Trim large tool output to the blocks the agent needs, before it enters the context. */
+    enabled: boolean;
+    /** Trim text results longer than this many characters. */
+    minChars: number;
+    /** For whole-file reads, trim only results longer than this. */
+    readMinChars: number;
+    /** At most this many blocks are judged. */
+    maxBlocks: number;
+    /** Characters of output sent to Jev; larger output is pre-filtered first. */
+    stateBudgetChars: number;
+    /** Keep blocks whose probability of being needed reaches this. */
+    keepThreshold: number;
+    /** Do not trim when Jev thinks the agent asked for the whole output. */
+    needsAllThreshold: number;
+    /** Do not trim when more than this share of lines would be kept. */
+    maxKeptShare: number;
+    headLines: number;
+    tailLines: number;
+  };
+  compact: {
+    /** Jev also filters what the harness's own summarizer reads (Pi's /compact and automatic compaction). */
+    filter: boolean;
+    /** The whole Jev pass over a conversation, in milliseconds per request. */
+    timeoutMs: number;
+    /** Jev requests in flight at once. */
+    concurrency: number;
+  };
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -59,6 +98,20 @@ export const DEFAULT_SETTINGS: Settings = {
     prompt: "Cache keep-alive. Do not use tools or think. Reply with exactly: ok",
   },
   herdr: { enabled: true },
+  jev: { enabled: true, provider: "", model: "", timeoutMs: 2_500 },
+  trim: {
+    enabled: true,
+    minChars: 12_000,
+    readMinChars: 50_000,
+    maxBlocks: 150,
+    stateBudgetChars: 60_000,
+    keepThreshold: 0.4,
+    needsAllThreshold: 0.6,
+    maxKeptShare: 0.7,
+    headLines: 5,
+    tailLines: 20,
+  },
+  compact: { filter: true, timeoutMs: 10_000, concurrency: 4 },
 };
 
 /** The herdr pane token the ports report (`herdr pane report-metadata --source cache-guard`). */
