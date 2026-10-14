@@ -919,7 +919,7 @@ async function status($: EngineInterface, s: State): Promise<string> {
 }
 
 /**
- * herdr's `cache` pane token: "cold 664k" once the cache has expired with a re-cache worth a
+ * herdr's `cache` pane token: "❄ 664k" once the cache has expired with a re-cache worth a
  * warning, nothing while it is warm (an expiry timer re-checks then) or small. Inside herdr only.
  */
 async function syncHerdr($: EngineInterface, s: State): Promise<void> {

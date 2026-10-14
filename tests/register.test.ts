@@ -312,7 +312,7 @@ test('inside herdr, the cache token shows a doomed session and clears when it is
   await clock.advance(59 * MIN)
   expect(w.herdr.length).toBe(1)
   await clock.advance(2 * MIN + 1_000)
-  expect(w.herdr.at(-1)).toBe('--source cache-guard --agent claude --token cache=cold 601k --ttl-ms 86400000')
+  expect(w.herdr.at(-1)).toBe('--source cache-guard --agent claude --token cache=❄ 601k --ttl-ms 86400000')
   await turn($, on, 600_000, 't2')
   expect(w.herdr.at(-1)).toBe('--source cache-guard --agent claude --clear-token cache')
   expect(w.herdr.length).toBe(3)

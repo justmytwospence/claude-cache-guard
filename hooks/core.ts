@@ -187,7 +187,7 @@ export type ColdReason =
   | { kind: "idle"; idleMs: number };
 
 /**
- * The herdr `cache` token: `cold 664k` (or `cold? 180k` when only idle time suggests it) while the
+ * The herdr `cache` token: `❄ 664k` (or `❄? 180k` when only idle time suggests it) while the
  * next prompt would re-cache at least the warning threshold, else undefined (clear the token).
  * Warm and small caches report nothing, so the sidebar lists only the doomed sessions.
  */
@@ -195,7 +195,7 @@ export function herdrCacheValue(reason: ColdReason | undefined, tokens: number, 
   if (!reason || !settings.enabled || !settings.herdr.enabled) return undefined;
   const big = cost !== undefined ? cost >= settings.warn.minCost : tokens >= settings.warn.minTokens;
   if (!big) return undefined;
-  return `${reason.kind === "idle" ? "cold?" : "cold"} ${formatTokens(tokens)}`;
+  return `${reason.kind === "idle" ? "❄?" : "❄"} ${formatTokens(tokens)}`;
 }
 
 /**

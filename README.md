@@ -117,7 +117,7 @@ in batches of up to 120, `compact.concurrency` requests at a time.
 belongs in your status line script, e.g. `jq '.prompt_cache.expires_at'`. The mod draws none.
 
 **Tells herdr.** Inside a [herdr](https://herdr.dev) pane, the mod sets the pane token `cache`
-with `herdr pane report-metadata --source cache-guard`. The token reads `cold 601k` once the cache
+with `herdr pane report-metadata --source cache-guard`. The token reads `❄ 601k` once the cache
 has expired and the next prompt would re-cache at least the warning threshold. It is cleared while
 the cache is warm or small, and when the session ends. An expiry timer flips it on time.
 herdr's agents sidebar shows it with `{ token = "$cache" }` in a `[ui.sidebar.agents]` row. Set
